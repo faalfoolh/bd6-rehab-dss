@@ -1,0 +1,10 @@
+.DS_Store
+*.zip
+*.mtb
+*.docx
+*.pptx
+*.ipynb
+bd6_ml_pipeline_executed.ipynb
+train_model.py
+plot_*.png
+__pycache__/
