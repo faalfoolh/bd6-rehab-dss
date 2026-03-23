@@ -2,5 +2,4 @@ streamlit
 numpy
 pandas
 scipy
-scikit-learn
 plotly
