@@ -1,8 +1,26 @@
 """
 BD6 — Stroke Rehabilitation Decision Support System
 """
+import os
+import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
+from scipy import signal
+
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+BODY_PARTS = ["Hand", "Wrist", "Elbow", "Shoulder"]
+
+@st.cache_data(show_spinner=False)
+def load_signals():
+    path = os.path.join(BASE_DIR, "signals.npz")
+    if not os.path.exists(path):
+        return {}
+    return dict(np.load(path, allow_pickle=False))
+
+def bandpass(data, fs=100, low=0.1, high=12.0, order=3):
+    nyq = 0.5 * fs
+    b, a = signal.butter(order, [low/nyq, high/nyq], btype="band")
+    return signal.filtfilt(b, a, data, axis=0)
 
 # ── Pre-computed classification results (hardcoded — instant load) ─────────
 RESULTS = {
@@ -53,7 +71,7 @@ with st.sidebar:
     st.title("🏥 Rehab DSS")
     st.markdown("**Stroke Rehabilitation**\nDecision Support System")
     st.divider()
-    page = st.radio("Navigate", ["🏠 Patient Overview", "📊 Patient Detail"])
+    page = st.radio("Navigate", ["🏠 Patient Overview", "📊 Patient Detail", "📈 Movement Signals"])
     if page != "🏠 Patient Overview":
         patient = st.selectbox("Select Patient", PARTICIPANTS)
     else:
@@ -145,3 +163,56 @@ elif page == "📊 Patient Detail":
                                    marker_colors=clrs, hole=0.4))
         fig2.update_layout(height=300, margin=dict(t=10, b=10))
         st.plotly_chart(fig2, use_container_width=True)
+
+# ── PAGE 3 — Movement Signals ─────────────────────────────────────────────
+elif page == "📈 Movement Signals":
+    p = patient
+    st.title(f"📈 {p} — Raw Movement Signals")
+    signals = load_signals()
+
+    available = [t for t in TASK_LABELS if f"{p}__{t}__Hand" in signals]
+    if not available:
+        st.warning("No signal data available for this patient.")
+    else:
+        task = st.selectbox("Select Movement", available,
+                            format_func=lambda t: f"{TASK_ICONS[t]} {TASK_LABELS[t]}")
+        bp   = st.selectbox("Select Sensor", BODY_PARTS)
+        key  = f"{p}__{task}__{bp}"
+
+        if key not in signals:
+            st.warning(f"No data for {bp} sensor in this session.")
+        else:
+            arr  = signals[key]
+            n    = min(len(arr), 3000)
+            t_ax = np.arange(n) / 100.0
+            axes_labels = ["Roll", "Pitch", "Yaw"]
+            colors_rpy  = ["#E74C3C", "#3498DB", "#2ECC71"]
+
+            st.subheader(f"Raw Signal — {bp}")
+            fig = go.Figure()
+            for i, (ax, col) in enumerate(zip(axes_labels, colors_rpy)):
+                fig.add_trace(go.Scatter(x=t_ax, y=arr[:n, i], name=ax,
+                                          line=dict(color=col, width=1.2)))
+            fig.update_layout(xaxis_title="Time (s)", yaxis_title="Angle (°)",
+                              plot_bgcolor="white", height=300,
+                              legend=dict(orientation="h", y=1.1),
+                              margin=dict(t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Filtered Signal (0.1–12 Hz Butterworth)")
+            filtered = bandpass(arr[:n])
+            fig2 = go.Figure()
+            for i, (ax, col) in enumerate(zip(axes_labels, colors_rpy)):
+                fig2.add_trace(go.Scatter(x=t_ax, y=filtered[:, i], name=ax,
+                                           line=dict(color=col, width=1.2)))
+            fig2.update_layout(xaxis_title="Time (s)", yaxis_title="Angle (°)",
+                               plot_bgcolor="white", height=300,
+                               legend=dict(orientation="h", y=1.1),
+                               margin=dict(t=10, b=10))
+            st.plotly_chart(fig2, use_container_width=True)
+
+            count = RESULTS[p].get(task, 0)
+            st.success(f"**Detected:** {TASK_ICONS[task]} {TASK_LABELS[task]} — {count} windows classified")
+            jerk = float(np.mean([np.sqrt(np.mean((np.diff(filtered[:, i]) * 100) ** 2)) for i in range(3)]))
+            quality = "Smooth 🟢" if jerk < 50 else ("Moderate 🟡" if jerk < 150 else "Jerky 🔴")
+            st.info(f"**Movement quality:** {quality}  (jerk: {jerk:.1f}°/s²)")
