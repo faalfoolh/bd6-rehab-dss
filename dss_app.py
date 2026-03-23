@@ -109,7 +109,8 @@ def load_all_data():
         st.error("Data file not found. Please run:  python3 train_model.py")
         st.stop()
     with open(data_path, 'rb') as f:
-        return pickle.load(f)
+        bundle = pickle.load(f)
+    return bundle['records'], bundle['precomputed']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PREPROCESSING & FEATURES
@@ -261,8 +262,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Load data & train model ────────────────────────────────────────────────
-with st.spinner('Loading data and model...'):
-    records = load_all_data()
+with st.spinner('Loading...'):
+    records, precomputed = load_all_data()
     svm, scaler, sfs, le = load_model()
 
 PARTICIPANTS = sorted(set(r['participant'] for r in records))
@@ -293,10 +294,7 @@ if page == '🏠 Patient Overview':
     st.divider()
 
     # Summary row
-    all_counts = {}
-    for p in PARTICIPANTS:
-        tc, _ = classify_patient(p, records, svm, scaler, sfs, le)
-        all_counts[p] = tc
+    all_counts = {p: precomputed[p]['task_counts'] for p in PARTICIPANTS}
 
     n_compliant = sum(1 for p in PARTICIPANTS if compliance_status(all_counts[p])[0] == 'Compliant')
     n_partial   = sum(1 for p in PARTICIPANTS if 'Partially' in compliance_status(all_counts[p])[0])
@@ -339,8 +337,8 @@ elif page == '📊 Patient Detail':
     p = selected_patient
     st.title(f'📊 {p} — Movement Detail')
 
-    with st.spinner(f'Classifying {p}\'s movements...'):
-        task_counts, raw_signals = classify_patient(p, records, svm, scaler, sfs, le)
+    task_counts = precomputed[p]['task_counts']
+    raw_signals = precomputed[p]['raw_signals']
 
     status, color, icon = compliance_status(task_counts)
     total = sum(task_counts.values())
@@ -410,8 +408,8 @@ elif page == '📈 Movement Signals':
     p = selected_patient
     st.title(f'📈 {p} — Raw Movement Signals')
 
-    with st.spinner('Loading signals...'):
-        task_counts, raw_signals = classify_patient(p, records, svm, scaler, sfs, le)
+    task_counts = precomputed[p]['task_counts']
+    raw_signals = precomputed[p]['raw_signals']
 
     if not raw_signals:
         st.warning('No signal data found for this patient.')
