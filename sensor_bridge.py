@@ -1,0 +1,251 @@
+"""
+sensor_bridge.py — Live Xsens MTW2 sensor reader + classifier
+Run this on the Windows laptop BEFORE opening the DSS in the browser:
+    python sensor_bridge.py
+
+It reads Roll/Pitch/Yaw from the 4 MTW2 sensors via the Awinda Station,
+classifies movement windows in real-time using the saved LDA weights,
+and writes results to live_data.json so the Streamlit app can read them.
+"""
+
+import os, sys, json, time, collections
+import numpy as np
+from scipy import signal as sp_signal
+from scipy.signal import find_peaks
+from scipy.stats import kurtosis, skew, entropy as sp_entropy
+
+# ── Xsens SDK ────────────────────────────────────────────────────────────────
+# The xsensdeviceapi files must be in the same folder as this script.
+# Copy them from:
+#   C:\Program Files\Xsens\MT Software Suite X.X\MT SDK\Examples\xda_python\
+try:
+    import xsensdeviceapi as xda
+except ImportError:
+    print("ERROR: xsensdeviceapi not found.")
+    print("Copy the xda_python folder contents into this project folder.")
+    sys.exit(1)
+
+# ── Sensor ID → Body part mapping ────────────────────────────────────────────
+# Edit this to match YOUR participant and task
+PARTICIPANT  = "Max"   # Change to: Max, Yusuf, Sara, Alfaf
+TASK         = "reach_retrieve"  # Change to: reach_retrieve, cup_to_lip, arm_swing, wrist_rotation
+
+SENSOR_MAPS = {
+    "Max":   {"00B44876": "Hand", "00B44805": "Wrist", "00B44856": "Elbow", "00B44877": "Shoulder"},
+    "Yusuf": {"00B44876": "Hand", "00B44805": "Wrist", "00B44856": "Elbow", "00B44877": "Shoulder"},
+    "Sara_reach_retrieve":  {"00B447F7": "Hand", "00B44804": "Wrist", "00B4486D": "Elbow", "00B44846": "Shoulder"},
+    "Alfaf_reach_retrieve": {"00B447F7": "Hand", "00B44804": "Wrist", "00B4486D": "Elbow", "00B44846": "Shoulder"},
+    "Sara_other":  {"00B447FD": "Hand", "00B447FA": "Wrist", "00B447F1": "Elbow", "00B44730": "Shoulder"},
+    "Alfaf_other": {"00B447FD": "Hand", "00B447FA": "Wrist", "00B447F1": "Elbow", "00B44730": "Shoulder"},
+}
+
+def get_sensor_map():
+    if PARTICIPANT in ("Max", "Yusuf"):
+        return SENSOR_MAPS["Max"]
+    key = f"{PARTICIPANT}_reach_retrieve" if TASK == "reach_retrieve" else f"{PARTICIPANT}_other"
+    return SENSOR_MAPS.get(key, SENSOR_MAPS["Max"])
+
+BODY_PARTS  = ["Hand", "Wrist", "Elbow", "Shoulder"]
+WINDOW_SIZE = 200   # 2 seconds at 100 Hz
+STEP_SIZE   = 100   # 1 second step
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+OUT_FILE    = os.path.join(BASE_DIR, "live_data.json")
+
+# ── Load LDA weights ──────────────────────────────────────────────────────────
+weights_path = os.path.join(BASE_DIR, "model_weights.json")
+if not os.path.exists(weights_path):
+    print("ERROR: model_weights.json not found. Run train_model.py first.")
+    sys.exit(1)
+
+with open(weights_path) as f:
+    weights = json.load(f)
+
+CLASSES     = weights["classes"]
+SC_MEAN     = np.array(weights["scaler_mean"])
+SC_STD      = np.array(weights["scaler_std"])
+LDA_COEF    = np.array(weights["lda_coef"])
+LDA_BIAS    = np.array(weights["lda_intercept"])
+
+TASK_LABELS = {
+    "reach_retrieve": "Reach & Retrieve",
+    "cup_to_lip":     "Cup to Lip",
+    "arm_swing":      "Arm Swing",
+    "wrist_rotation": "Wrist Rotation",
+}
+
+# ── Signal processing helpers ─────────────────────────────────────────────────
+def bandpass(data, fs=100, low=0.1, high=12.0, order=3):
+    nyq = 0.5 * fs
+    b, a = sp_signal.butter(order, [low / nyq, high / nyq], btype="band")
+    return sp_signal.filtfilt(b, a, data, axis=0)
+
+def _entropy(x, n_bins=20):
+    h, _ = np.histogram(x, bins=n_bins, density=True)
+    return sp_entropy(h + 1e-12)
+
+def _jerk(x, fs=100):
+    return np.sqrt(np.mean((np.diff(x) * fs) ** 2))
+
+def extract_features(window):
+    feats = []
+    for ch in range(window.shape[1]):
+        x = window[:, ch]
+        peaks, _ = find_peaks(np.abs(x))
+        pa = np.abs(x[peaks]) if len(peaks) > 0 else np.array([0.0])
+        feats.extend([
+            np.std(x), np.sqrt(np.mean(x**2)), _entropy(x), _jerk(x),
+            len(peaks), np.max(pa), np.sum(np.abs(np.diff(x))),
+            np.var(x) / (np.mean(np.abs(x)) + 1e-12), kurtosis(x), skew(x),
+        ])
+    return np.array(feats)
+
+def classify_window(window):
+    feat  = extract_features(window).reshape(1, -1)
+    X_sc  = (feat - SC_MEAN) / SC_STD
+    score = X_sc @ LDA_COEF.T + LDA_BIAS
+    return CLASSES[int(np.argmax(score))]
+
+# ── Rolling buffers — one per body part ──────────────────────────────────────
+BUFFERS = {bp: collections.deque(maxlen=WINDOW_SIZE * 2) for bp in BODY_PARTS}
+sample_counts = {bp: 0 for bp in BODY_PARTS}
+
+task_counts   = {t: 0 for t in TASK_LABELS}
+window_count  = 0
+last_detection = "Waiting..."
+last_quality   = ""
+
+def write_live_data(status="running"):
+    jerk_val = 0.0
+    if len(BUFFERS["Hand"]) >= 10:
+        arr = np.array(list(BUFFERS["Hand"]))[-100:]
+        if arr.shape[0] > 1 and arr.ndim == 2:
+            jerk_val = float(np.mean([_jerk(arr[:, i]) for i in range(arr.shape[1])]))
+    quality = "Smooth" if jerk_val < 50 else ("Moderate" if jerk_val < 150 else "Jerky")
+
+    data = {
+        "status":        status,
+        "participant":   PARTICIPANT,
+        "task_counts":   task_counts,
+        "window_count":  window_count,
+        "last_detected": last_detection,
+        "quality":       quality,
+        "timestamp":     time.time(),
+        "signal_preview": {
+            bp: [list(row) for row in list(BUFFERS[bp])[-200:]]
+            for bp in BODY_PARTS if len(BUFFERS[bp]) > 0
+        },
+    }
+    with open(OUT_FILE, "w") as f:
+        json.dump(data, f)
+
+# ── Xsens callback ────────────────────────────────────────────────────────────
+class XsCallback(xda.XsCallback):
+    def __init__(self, sensor_map):
+        super().__init__()
+        self.sensor_map = sensor_map   # device_id_str -> body_part
+
+    def onLiveDataAvailable(self, dev, packet):
+        if not packet.containsOrientation():
+            return
+        dev_id = str(dev.deviceId())
+        body_part = self.sensor_map.get(dev_id)
+        if body_part is None:
+            return
+
+        euler = packet.orientationEuler()
+        row   = [euler.roll(), euler.pitch(), euler.yaw()]
+        BUFFERS[body_part].append(row)
+        sample_counts[body_part] += 1
+
+        # Classify when all buffers have enough data
+        global window_count, last_detection
+        if all(len(BUFFERS[bp]) >= WINDOW_SIZE for bp in BODY_PARTS):
+            if sample_counts["Hand"] % STEP_SIZE == 0:
+                try:
+                    win = np.hstack([
+                        np.array(list(BUFFERS[bp]))[-WINDOW_SIZE:]
+                        for bp in BODY_PARTS
+                    ])
+                    filt    = bandpass(win)
+                    label   = classify_window(filt)
+                    task_counts[label] += 1
+                    window_count       += 1
+                    last_detection      = TASK_LABELS.get(label, label)
+                    write_live_data()
+                    print(f"  Window {window_count:4d} → {last_detection}")
+                except Exception as e:
+                    print(f"  Classification error: {e}")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    sensor_map = get_sensor_map()
+    print(f"\nBD6 Live Sensor Bridge")
+    print(f"Participant: {PARTICIPANT}  |  Task: {TASK_LABELS.get(TASK, TASK)}")
+    print(f"Sensor map: {sensor_map}\n")
+
+    control  = xda.XsControl.construct()
+    callback = XsCallback(sensor_map)
+
+    # Scan for Awinda Station
+    print("Scanning for Awinda Station...")
+    port_info_array = xda.XsScanner.scanPorts()
+    awinda_port = None
+    for port_info in port_info_array:
+        if port_info.deviceId().isAwinda():
+            awinda_port = port_info
+            break
+
+    if awinda_port is None:
+        print("ERROR: Awinda Station not found. Make sure it is plugged in.")
+        sys.exit(1)
+
+    print(f"Found Awinda on port {awinda_port.portName()} at {awinda_port.baudrate()} baud")
+
+    if not control.openPort(awinda_port.portName(), awinda_port.baudrate()):
+        print("ERROR: Could not open port.")
+        sys.exit(1)
+
+    master_id = awinda_port.deviceId()
+    master    = control.device(master_id)
+    master.addCallbackHandler(callback)
+
+    print(f"Master device: {master_id}")
+    print("Waiting for MTW sensors to connect (turn them on now)...")
+
+    # Wait until all 4 MTW sensors are connected
+    while True:
+        children = [master.child(i) for i in range(master.childCount())]
+        connected_ids = [str(c.deviceId()) for c in children]
+        found = [bp for dev_id, bp in sensor_map.items() if dev_id in connected_ids]
+        print(f"  Connected: {found}", end="\r")
+        if len(found) == 4:
+            break
+        time.sleep(1)
+
+    print(f"\nAll 4 sensors connected!")
+
+    # Go to measurement mode
+    if not master.gotoMeasurement():
+        print("ERROR: Could not start measurement.")
+        sys.exit(1)
+
+    print("Streaming... Open the DSS in your browser and go to Live Monitor.")
+    print("Press Ctrl+C to stop.\n")
+
+    write_live_data(status="running")
+
+    try:
+        while True:
+            time.sleep(1)
+            write_live_data(status="running")
+    except KeyboardInterrupt:
+        print("\nStopping...")
+
+    master.gotoConfig()
+    control.closePort(awinda_port.portName())
+    control.destruct()
+    write_live_data(status="stopped")
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
