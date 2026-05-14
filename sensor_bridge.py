@@ -148,14 +148,16 @@ class XsCallback(xda.XsCallback):
 
     def onConnectivityChanged(self, dev, new_state):
         dev_id = str(dev.deviceId())
+        print(f"\n  [DEBUG] Connectivity: {dev_id} state={new_state}")
         with self._lock:
-            # XCS_Wireless = 8  (connected wirelessly)
-            if new_state == 8:
+            # Any non-zero state means the device is present/connected
+            if new_state != 0:
                 self.connected_mtws.add(dev_id)
                 bp = self.sensor_map.get(dev_id, "Unknown")
-                print(f"\n  + Connected: {dev_id} ({bp})")
+                print(f"  + Sensor present: {dev_id} ({bp})")
             else:
                 self.connected_mtws.discard(dev_id)
+                print(f"  - Sensor disconnected: {dev_id}")
 
     def onLiveDataAvailable(self, dev, packet):
         if not packet.containsOrientation():
@@ -220,9 +222,21 @@ def main():
 
     master_id = awinda_port.deviceId()
     master    = control.device(master_id)
+
+    # Add callback to both control and master device
+    control.addCallbackHandler(callback)
     master.addCallbackHandler(callback)
 
     print(f"Master device: {master_id}")
+
+    # Make sure Awinda is in config mode and radio is on
+    master.gotoConfig()
+    try:
+        master.enableRadio(19)   # channel 19 — change if sensors don't connect
+        print("Radio enabled on channel 19")
+    except Exception as e:
+        print(f"  (enableRadio not available or already on: {e})")
+
     print("Waiting for MTW sensors to connect (turn them on now)...")
 
     # Wait until all 4 MTW sensors are connected via onConnectivityChanged
