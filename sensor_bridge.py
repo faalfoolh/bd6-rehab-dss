@@ -99,11 +99,30 @@ def extract_features(window):
         ])
     return np.array(feats)
 
+MOTION_THRESHOLD   = 3.0   # degrees std — below this = sensor is still
+CONFIDENCE_THRESHOLD = 0.55  # softmax probability — below this = uncertain
+
 def classify_window(window):
-    feat  = extract_features(window).reshape(1, -1)
-    X_sc  = (feat - SC_MEAN) / SC_STD
-    score = X_sc @ LDA_COEF.T + LDA_BIAS
-    return CLASSES[int(np.argmax(score))]
+    """Returns (label, confidence) or (None, 0) if not moving / uncertain."""
+    # Motion gate — skip if sensor is barely moving
+    motion = float(np.mean([np.std(window[:, i]) for i in range(window.shape[1])]))
+    if motion < MOTION_THRESHOLD:
+        return None, 0.0   # idle
+
+    feat   = extract_features(window).reshape(1, -1)
+    X_sc   = (feat - SC_MEAN) / SC_STD
+    scores = (X_sc @ LDA_COEF.T + LDA_BIAS)[0]
+
+    # Softmax confidence
+    exp_s  = np.exp(scores - scores.max())
+    probs  = exp_s / exp_s.sum()
+    best   = int(np.argmax(probs))
+    conf   = float(probs[best])
+
+    if conf < CONFIDENCE_THRESHOLD:
+        return None, conf  # uncertain
+
+    return CLASSES[best], conf
 
 # ── Rolling buffers — one per body part ──────────────────────────────────────
 BUFFERS       = {bp: collections.deque(maxlen=WINDOW_SIZE * 4) for bp in BODY_PARTS}
@@ -185,21 +204,32 @@ class XsCallback(xda.XsCallback):
                         np.array(list(BUFFERS[bp]))[-WINDOW_SIZE:]
                         for bp in BODY_PARTS
                     ])
-                    filt          = bandpass(win)
-                    label         = classify_window(filt)
+                    filt              = bandpass(win)
+                    label, conf       = classify_window(filt)
                     quality_str, jerk_val = compute_quality(filt)
-                    task_counts[label] += 1
-                    window_count       += 1
-                    last_detection      = TASK_LABELS.get(label, label)
-                    last_quality        = quality_str
-                    history.append({
-                        "Window":    window_count,
-                        "Movement":  last_detection,
-                        "Quality":   quality_str,
-                        "Jerk":      round(jerk_val, 1),
-                    })
-                    write_live_data()
-                    print(f"  Window {window_count:4d} → {last_detection}  [{quality_str}]")
+
+                    if label is None:
+                        # Still or uncertain — don't count, but update display
+                        motion = float(np.mean([np.std(filt[:, i]) for i in range(filt.shape[1])]))
+                        idle_msg = "Idle (no movement)" if motion < MOTION_THRESHOLD else f"Uncertain ({conf:.0%})"
+                        last_detection = idle_msg
+                        last_quality   = quality_str
+                        write_live_data()
+                        print(f"  Window  --- → {idle_msg}")
+                    else:
+                        task_counts[label] += 1
+                        window_count       += 1
+                        last_detection      = TASK_LABELS.get(label, label)
+                        last_quality        = f"{quality_str}  ({conf:.0%} confident)"
+                        history.append({
+                            "Window":      window_count,
+                            "Movement":    last_detection,
+                            "Quality":     quality_str,
+                            "Confidence":  f"{conf:.0%}",
+                            "Jerk":        round(jerk_val, 1),
+                        })
+                        write_live_data()
+                        print(f"  Window {window_count:4d} → {last_detection}  [{quality_str}  {conf:.0%}]")
                 except Exception as e:
                     print(f"  Classification error: {e}")
 
