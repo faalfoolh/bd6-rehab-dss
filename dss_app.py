@@ -1,14 +1,32 @@
 """
 BD6 — Stroke Rehabilitation Decision Support System
 """
-import os
+import os, json, io
 import numpy as np
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from scipy import signal
+from scipy.signal import find_peaks
+from scipy.stats import kurtosis, skew, entropy as sp_entropy
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 BODY_PARTS = ["Hand", "Wrist", "Elbow", "Shoulder"]
+
+@st.cache_data(show_spinner=False)
+def load_model_weights():
+    with open(os.path.join(BASE_DIR, "model_weights.json")) as f:
+        return json.load(f)
+
+def classify_windows(windows, weights):
+    """Classify windows using saved LDA weights — no sklearn needed."""
+    mean = np.array(weights["scaler_mean"])
+    std  = np.array(weights["scaler_std"])
+    coef = np.array(weights["lda_coef"])
+    bias = np.array(weights["lda_intercept"])
+    X_sc = (windows - mean) / std
+    scores = X_sc @ coef.T + bias
+    return np.argmax(scores, axis=1)
 
 @st.cache_data(show_spinner=False)
 def load_signals():
@@ -21,6 +39,50 @@ def bandpass(data, fs=100, low=0.1, high=12.0, order=3):
     nyq = 0.5 * fs
     b, a = signal.butter(order, [low/nyq, high/nyq], btype="band")
     return signal.filtfilt(b, a, data, axis=0)
+
+def _entropy(x, n_bins=20):
+    h, _ = np.histogram(x, bins=n_bins, density=True)
+    return sp_entropy(h + 1e-12)
+
+def _jerk(x, fs=100):
+    return np.sqrt(np.mean((np.diff(x) * fs) ** 2))
+
+def extract_features(window):
+    feats = []
+    for ch in range(window.shape[1]):
+        x = window[:, ch]
+        peaks, _ = find_peaks(np.abs(x))
+        pa = np.abs(x[peaks]) if len(peaks) > 0 else np.array([0.0])
+        feats.extend([
+            np.std(x), np.sqrt(np.mean(x**2)), _entropy(x), _jerk(x),
+            len(peaks), np.max(pa), np.sum(np.abs(np.diff(x))),
+            np.var(x) / (np.mean(np.abs(x)) + 1e-12), kurtosis(x), skew(x),
+        ])
+    return np.array(feats)
+
+def sliding_windows(arr, ws=200, ss=100):
+    out, start = [], 0
+    while start + ws <= len(arr):
+        out.append(arr[start:start + ws])
+        start += ss
+    return out
+
+def parse_sensor_file(uploaded_file):
+    """Read an Xsens .txt file uploaded via Streamlit, return (device_id, DataFrame[Roll,Pitch,Yaw])."""
+    content = uploaded_file.read().decode("utf-8", errors="replace")
+    lines   = content.splitlines()
+    device_id = None
+    for line in lines:
+        if "DeviceId" in line:
+            device_id = line.strip().split(":")[-1].strip()
+            break
+    try:
+        df = pd.read_csv(io.StringIO(content), sep="\t", skiprows=12, engine="python")
+        df.columns = df.columns.str.strip()
+        df = df[["Roll", "Pitch", "Yaw"]].dropna().astype(float)
+        return device_id, df
+    except Exception:
+        return device_id, None
 
 # ── Pre-computed classification results (hardcoded — instant load) ─────────
 RESULTS = {
@@ -71,7 +133,7 @@ with st.sidebar:
     st.title("🏥 Rehab DSS")
     st.markdown("**Stroke Rehabilitation**\nDecision Support System")
     st.divider()
-    page = st.radio("Navigate", ["🏠 Patient Overview", "📊 Patient Detail", "📈 Movement Signals", "🔴 Live Monitor"])
+    page = st.radio("Navigate", ["🏠 Patient Overview", "📊 Patient Detail", "📈 Movement Signals", "🔴 Live Monitor", "📂 Offline Analysis"])
     if page != "🏠 Patient Overview":
         patient = st.selectbox("Select Patient", PARTICIPANTS)
     else:
@@ -341,3 +403,135 @@ elif page == "🔴 Live Monitor":
             st.session_state.live_pos += STEP
             time.sleep(0.5)
             st.rerun()
+
+# ── PAGE 5 — Offline Analysis ─────────────────────────────────────────────
+elif page == "📂 Offline Analysis":
+    st.title("📂 Offline Sensor Analysis")
+    st.markdown(
+        "Upload the four `.txt` sensor files recorded during a session. "
+        "The system will classify each movement window and show a compliance report."
+    )
+
+    WINDOW_SIZE = 200
+    STEP_SIZE   = 100
+
+    col_h, col_w, col_e, col_s = st.columns(4)
+    up_hand     = col_h.file_uploader("Hand",     type="txt", key="up_hand")
+    up_wrist    = col_w.file_uploader("Wrist",    type="txt", key="up_wrist")
+    up_elbow    = col_e.file_uploader("Elbow",    type="txt", key="up_elbow")
+    up_shoulder = col_s.file_uploader("Shoulder", type="txt", key="up_shoulder")
+
+    uploads = {"Hand": up_hand, "Wrist": up_wrist, "Elbow": up_elbow, "Shoulder": up_shoulder}
+    ready   = all(v is not None for v in uploads.values())
+
+    if not ready:
+        missing = [k for k, v in uploads.items() if v is None]
+        st.info(f"Please upload all 4 sensor files. Still missing: **{', '.join(missing)}**")
+        st.stop()
+
+    # Parse files
+    with st.spinner("Parsing sensor files..."):
+        parsed = {}
+        errors = []
+        for bp, uf in uploads.items():
+            dev_id, df = parse_sensor_file(uf)
+            if df is None or len(df) < WINDOW_SIZE:
+                errors.append(f"{bp}: could not parse or too short (got {0 if df is None else len(df)} rows)")
+            else:
+                parsed[bp] = df
+
+    if errors:
+        for e in errors:
+            st.error(e)
+        st.stop()
+
+    # Filter + combine
+    with st.spinner("Filtering and classifying..."):
+        filt_map = {bp: bandpass(df.values) for bp, df in parsed.items()}
+        min_len  = min(len(v) for v in filt_map.values())
+        combined = np.hstack([filt_map[bp][:min_len] for bp in BODY_PARTS])
+
+        wins = sliding_windows(combined, WINDOW_SIZE, STEP_SIZE)
+        if not wins:
+            st.error("Not enough data to form even one window (need at least 2 seconds of data).")
+            st.stop()
+
+        weights = load_model_weights()
+        X_feat  = np.array([extract_features(w) for w in wins])
+        pred_idx = classify_windows(X_feat, weights)
+        classes  = weights["classes"]
+        preds    = [classes[i] for i in pred_idx]
+
+    # Count predictions
+    task_counts = {t: preds.count(t) for t in TASK_LABELS}
+    status, color, icon = compliance_status(task_counts)
+    total = len(preds)
+
+    st.divider()
+    st.subheader("Classification Results")
+
+    st.markdown(f"""
+    <div style="background:{color}22;border:2px solid {color};border-radius:10px;
+                padding:1rem;margin-bottom:1rem;">
+        <h2 style="margin:0;color:{color}">{icon} {status}</h2>
+        <p style="margin:0">Total windows classified: <b>{total}</b></p>
+    </div>""", unsafe_allow_html=True)
+
+    # Bar chart
+    fig = go.Figure(go.Bar(
+        x=[TASK_LABELS[t] for t in TASK_LABELS],
+        y=[task_counts.get(t, 0) for t in TASK_LABELS],
+        marker_color=[TASK_COLORS[t] for t in TASK_LABELS],
+        text=[task_counts.get(t, 0) for t in TASK_LABELS],
+        textposition="outside",
+    ))
+    fig.update_layout(yaxis_title="Windows Detected", plot_bgcolor="white",
+                      height=320, margin=dict(t=20, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Movement cards
+    cols2 = st.columns(2)
+    for i, (task, label) in enumerate(TASK_LABELS.items()):
+        count = task_counts.get(task, 0)
+        done  = count > 0
+        bg    = "#2ECC7122" if done else "#E74C3C22"
+        bdr   = "#2ECC71"   if done else "#E74C3C"
+        pct   = f"{count/total*100:.0f}%" if total > 0 else "0%"
+        with cols2[i % 2]:
+            st.markdown(f"""
+            <div style="background:{bg};border:2px solid {bdr};border-radius:10px;
+                        padding:1rem;margin-bottom:0.8rem;text-align:center;">
+                <h3 style="margin:0">{TASK_ICONS[task]} {label}</h3>
+                <p style="margin:4px 0;font-size:1.2rem">{"✅ Performed" if done else "❌ Not Performed"}</p>
+                <p style="margin:0;color:#555">{count} windows ({pct})</p>
+            </div>""", unsafe_allow_html=True)
+
+    st.divider()
+
+    # Signal preview
+    st.subheader("Signal Preview")
+    bp_sel = st.selectbox("Sensor to plot", BODY_PARTS, key="offline_bp")
+    raw_arr  = parsed[bp_sel].values
+    filt_arr = filt_map[bp_sel]
+    n        = min(len(raw_arr), 3000)
+    t_ax     = np.arange(n) / 100.0
+    axes_labels = ["Roll", "Pitch", "Yaw"]
+    colors_rpy  = ["#E74C3C", "#3498DB", "#2ECC71"]
+
+    tab_raw, tab_filt = st.tabs(["Raw Signal", "Filtered (0.1–12 Hz)"])
+    with tab_raw:
+        fig_r = go.Figure()
+        for i, (ax, c) in enumerate(zip(axes_labels, colors_rpy)):
+            fig_r.add_trace(go.Scatter(x=t_ax, y=raw_arr[:n, i], name=ax, line=dict(color=c, width=1.2)))
+        fig_r.update_layout(xaxis_title="Time (s)", yaxis_title="Angle (°)",
+                            plot_bgcolor="white", height=280,
+                            legend=dict(orientation="h", y=1.1), margin=dict(t=10, b=10))
+        st.plotly_chart(fig_r, use_container_width=True)
+    with tab_filt:
+        fig_f = go.Figure()
+        for i, (ax, c) in enumerate(zip(axes_labels, colors_rpy)):
+            fig_f.add_trace(go.Scatter(x=t_ax, y=filt_arr[:n, i], name=ax, line=dict(color=c, width=1.2)))
+        fig_f.update_layout(xaxis_title="Time (s)", yaxis_title="Angle (°)",
+                            plot_bgcolor="white", height=280,
+                            legend=dict(orientation="h", y=1.1), margin=dict(t=10, b=10))
+        st.plotly_chart(fig_f, use_container_width=True)
