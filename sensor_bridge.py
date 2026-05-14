@@ -58,7 +58,7 @@ def auto_detect_sensor_map(connected_ids):
 
 BODY_PARTS  = ["Hand", "Wrist", "Elbow", "Shoulder"]
 WINDOW_SIZE = 200   # 2 seconds at 100 Hz
-STEP_SIZE   = 100   # 1 second step
+STEP_SIZE   = 50    # classify every 0.5 seconds
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 OUT_FILE    = os.path.join(BASE_DIR, "live_data.json")
 

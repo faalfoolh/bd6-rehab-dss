@@ -357,7 +357,7 @@ elif page == "🔴 Live Monitor":
             st.dataframe(pd.DataFrame(history[::-1]),   # newest first
                          use_container_width=True, hide_index=True)
 
-        time.sleep(1)
+        time.sleep(0.3)
         st.rerun()
 
     st.markdown("Simulating real-time sensor stream from pre-recorded data.")
