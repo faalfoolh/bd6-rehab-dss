@@ -287,59 +287,63 @@ elif page == "🔴 Live Monitor":
     st.title(f"🔴 Live Monitoring — {p}")
 
     # ── Real sensor mode: reads from sensor_bridge.py output ──────────────
-    live_path = os.path.join(BASE_DIR, "live_data.json")
+    live_path  = os.path.join(BASE_DIR, "live_data.json")
+    using_live = False
+    live       = None
+
     if os.path.exists(live_path):
         try:
             with open(live_path) as f:
                 live = json.load(f)
             age = time.time() - live.get("timestamp", 0)
             if live.get("status") == "running" and age < 5:
-                st.success("🔴 **LIVE** — receiving data from Xsens sensors")
-                tc     = live.get("task_counts", {})
-                total  = live.get("window_count", 0)
-                status, color, icon = compliance_status(tc)
-                st.markdown(f"""
-                <div style="background:{color}22;border:2px solid {color};border-radius:10px;
-                            padding:1rem;margin-bottom:1rem;">
-                    <h2 style="margin:0;color:{color}">{icon} {status}</h2>
-                    <p style="margin:0">Windows classified: <b>{total}</b> &nbsp;|&nbsp;
-                    Last detected: <b>{live.get('last_detected','—')}</b> &nbsp;|&nbsp;
-                    Quality: <b>{live.get('quality','—')}</b></p>
-                </div>""", unsafe_allow_html=True)
-
-                fig = go.Figure(go.Bar(
-                    x=[TASK_LABELS[t] for t in TASK_LABELS],
-                    y=[tc.get(t, 0) for t in TASK_LABELS],
-                    marker_color=[TASK_COLORS[t] for t in TASK_LABELS],
-                    text=[tc.get(t, 0) for t in TASK_LABELS],
-                    textposition="outside"))
-                fig.update_layout(yaxis_title="Windows", plot_bgcolor="white",
-                                  height=300, margin=dict(t=20, b=20))
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Signal preview from live buffer
-                preview = live.get("signal_preview", {})
-                if preview:
-                    bp_sel = st.selectbox("Sensor preview", BODY_PARTS, key="live_bp")
-                    arr = np.array(preview.get(bp_sel, []))
-                    if arr.ndim == 2 and len(arr) > 1:
-                        t_ax = np.arange(len(arr)) / 100.0
-                        fig2 = go.Figure()
-                        for i, (ax, c) in enumerate(zip(["Roll","Pitch","Yaw"],
-                                                        ["#E74C3C","#3498DB","#2ECC71"])):
-                            fig2.add_trace(go.Scatter(x=t_ax, y=arr[:, i], name=ax,
-                                                      line=dict(color=c, width=1.2)))
-                        fig2.update_layout(xaxis_title="Time (s)", yaxis_title="Angle (°)",
-                                           plot_bgcolor="white", height=260,
-                                           legend=dict(orientation="h", y=1.1),
-                                           margin=dict(t=10, b=10))
-                        st.plotly_chart(fig2, use_container_width=True)
-
-                time.sleep(1)
-                st.rerun()
-                st.stop()
+                using_live = True
         except Exception:
-            pass  # fall through to simulation mode
+            pass
+
+    if using_live and live:
+        st.success("🔴 **LIVE** — receiving data from Xsens sensors")
+        tc     = live.get("task_counts", {})
+        total  = live.get("window_count", 0)
+        status, color, icon = compliance_status(tc)
+        st.markdown(f"""
+        <div style="background:{color}22;border:2px solid {color};border-radius:10px;
+                    padding:1rem;margin-bottom:1rem;">
+            <h2 style="margin:0;color:{color}">{icon} {status}</h2>
+            <p style="margin:0">Windows classified: <b>{total}</b> &nbsp;|&nbsp;
+            Last detected: <b>{live.get('last_detected','—')}</b> &nbsp;|&nbsp;
+            Quality: <b>{live.get('quality','—')}</b></p>
+        </div>""", unsafe_allow_html=True)
+
+        fig = go.Figure(go.Bar(
+            x=[TASK_LABELS[t] for t in TASK_LABELS],
+            y=[tc.get(t, 0) for t in TASK_LABELS],
+            marker_color=[TASK_COLORS[t] for t in TASK_LABELS],
+            text=[tc.get(t, 0) for t in TASK_LABELS],
+            textposition="outside"))
+        fig.update_layout(yaxis_title="Windows", plot_bgcolor="white",
+                          height=300, margin=dict(t=20, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+        preview = live.get("signal_preview", {})
+        if preview:
+            bp_sel = st.selectbox("Sensor preview", BODY_PARTS, key="live_bp")
+            arr = np.array(preview.get(bp_sel, []))
+            if arr.ndim == 2 and len(arr) > 1:
+                t_ax = np.arange(len(arr)) / 100.0
+                fig2 = go.Figure()
+                for i, (ax, c) in enumerate(zip(["Roll", "Pitch", "Yaw"],
+                                                ["#E74C3C", "#3498DB", "#2ECC71"])):
+                    fig2.add_trace(go.Scatter(x=t_ax, y=arr[:, i], name=ax,
+                                              line=dict(color=c, width=1.2)))
+                fig2.update_layout(xaxis_title="Time (s)", yaxis_title="Angle (°)",
+                                   plot_bgcolor="white", height=260,
+                                   legend=dict(orientation="h", y=1.1),
+                                   margin=dict(t=10, b=10))
+                st.plotly_chart(fig2, use_container_width=True)
+
+        time.sleep(1)
+        st.rerun()
 
     st.markdown("Simulating real-time sensor stream from pre-recorded data.")
 
