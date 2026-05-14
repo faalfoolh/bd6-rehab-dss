@@ -296,7 +296,7 @@ elif page == "🔴 Live Monitor":
             with open(live_path) as f:
                 live = json.load(f)
             age = time.time() - live.get("timestamp", 0)
-            if live.get("status") == "running" and age < 5:
+            if live.get("status") == "running" and age < 15:
                 using_live = True
         except Exception:
             pass

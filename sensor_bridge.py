@@ -322,7 +322,7 @@ def main():
 
     try:
         while True:
-            time.sleep(1)
+            time.sleep(0.5)
             write_live_data(status="running")
     except KeyboardInterrupt:
         print("\nStopping...")
