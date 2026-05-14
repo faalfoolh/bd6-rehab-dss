@@ -25,25 +25,36 @@ except ImportError:
     print("Copy the xda_python folder contents into this project folder.")
     sys.exit(1)
 
-# ── Sensor ID → Body part mapping ────────────────────────────────────────────
-# Edit this to match YOUR participant and task
-PARTICIPANT  = "Max"   # Change to: Max, Yusuf, Sara, Alfaf
-TASK         = "reach_retrieve"  # Change to: reach_retrieve, cup_to_lip, arm_swing, wrist_rotation
-
-SENSOR_MAPS = {
-    "Max":   {"00B44876": "Hand", "00B44805": "Wrist", "00B44856": "Elbow", "00B44877": "Shoulder"},
-    "Yusuf": {"00B44876": "Hand", "00B44805": "Wrist", "00B44856": "Elbow", "00B44877": "Shoulder"},
-    "Sara_reach_retrieve":  {"00B447F7": "Hand", "00B44804": "Wrist", "00B4486D": "Elbow", "00B44846": "Shoulder"},
-    "Alfaf_reach_retrieve": {"00B447F7": "Hand", "00B44804": "Wrist", "00B4486D": "Elbow", "00B44846": "Shoulder"},
-    "Sara_other":  {"00B447FD": "Hand", "00B447FA": "Wrist", "00B447F1": "Elbow", "00B44730": "Shoulder"},
-    "Alfaf_other": {"00B447FD": "Hand", "00B447FA": "Wrist", "00B447F1": "Elbow", "00B44730": "Shoulder"},
+# ── Sensor ID → Body part mapping (auto-detected from connected sensor IDs) ──
+# All known sensor sets — participant and task are identified automatically
+ALL_SENSOR_MAPS = {
+    "Max / Yusuf": {
+        "00B44876": "Hand", "00B44805": "Wrist",
+        "00B44856": "Elbow", "00B44877": "Shoulder",
+    },
+    "Sara / Alfaf (Reach & Retrieve)": {
+        "00B447F7": "Hand", "00B44804": "Wrist",
+        "00B4486D": "Elbow", "00B44846": "Shoulder",
+    },
+    "Sara / Alfaf (Other movements)": {
+        "00B447FD": "Hand", "00B447FA": "Wrist",
+        "00B447F1": "Elbow", "00B44730": "Shoulder",
+    },
 }
 
-def get_sensor_map():
-    if PARTICIPANT in ("Max", "Yusuf"):
-        return SENSOR_MAPS["Max"]
-    key = f"{PARTICIPANT}_reach_retrieve" if TASK == "reach_retrieve" else f"{PARTICIPANT}_other"
-    return SENSOR_MAPS.get(key, SENSOR_MAPS["Max"])
+def auto_detect_sensor_map(connected_ids):
+    """Match connected sensor IDs to the correct participant sensor set."""
+    connected_set = set(connected_ids)
+    best_map  = None
+    best_name = "Unknown"
+    best_overlap = 0
+    for name, smap in ALL_SENSOR_MAPS.items():
+        overlap = len(connected_set & set(smap.keys()))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_map     = smap
+            best_name    = name
+    return best_name, best_map
 
 BODY_PARTS  = ["Hand", "Wrist", "Elbow", "Shoulder"]
 WINDOW_SIZE = 200   # 2 seconds at 100 Hz
@@ -128,11 +139,12 @@ def classify_window(window):
 BUFFERS       = {bp: collections.deque(maxlen=WINDOW_SIZE * 4) for bp in BODY_PARTS}
 sample_counts = {bp: 0 for bp in BODY_PARTS}
 
-task_counts    = {t: 0 for t in TASK_LABELS}
-window_count   = 0
-last_detection = "Waiting..."
-last_quality   = "—"
-history        = []   # list of {time, movement, quality}
+task_counts      = {t: 0 for t in TASK_LABELS}
+window_count     = 0
+last_detection   = "Waiting..."
+last_quality     = "—"
+history          = []
+participant_name = "Detecting..."
 
 def compute_quality(filtered_window):
     """Compute jerk-based quality label from a filtered window."""
@@ -146,7 +158,7 @@ def compute_quality(filtered_window):
 def write_live_data(status="running"):
     data = {
         "status":        status,
-        "participant":   PARTICIPANT,
+        "participant":   participant_name,
         "task_counts":   task_counts,
         "window_count":  window_count,
         "last_detected": last_detection,
@@ -196,7 +208,7 @@ class XsCallback(xda.XsCallback):
         sample_counts[body_part] += 1
 
         # Classify when all buffers have enough data
-        global window_count, last_detection, last_quality
+        global window_count, last_detection, last_quality, participant_name
         if all(len(BUFFERS[bp]) >= WINDOW_SIZE for bp in BODY_PARTS):
             if sample_counts["Hand"] % STEP_SIZE == 0:
                 try:
@@ -235,13 +247,11 @@ class XsCallback(xda.XsCallback):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    sensor_map = get_sensor_map()
-    print(f"\nBD6 Live Sensor Bridge")
-    print(f"Participant: {PARTICIPANT}  |  Task: {TASK_LABELS.get(TASK, TASK)}")
-    print(f"Sensor map: {sensor_map}\n")
+    print(f"\nBD6 Live Sensor Bridge — Auto-detecting participant from sensor IDs")
 
     control  = xda.XsControl.construct()
-    callback = XsCallback(sensor_map)
+    # Start with empty sensor map — will be filled after auto-detection
+    callback = XsCallback({})
 
     # Scan for Awinda Station
     print("Scanning for Awinda Station...")
@@ -280,19 +290,25 @@ def main():
         print(f"  (enableRadio not available or already on: {e})")
 
     print("Waiting for MTW sensors to connect (turn them on now)...")
-
-    # Wait until all 4 MTW sensors are connected via onConnectivityChanged
     print("  (Turn on the 4 MTW sensors now...)")
+
+    # Wait until 4 sensors connect, then auto-detect which participant they belong to
     while True:
         with callback._lock:
-            found = [bp for dev_id, bp in sensor_map.items()
-                     if dev_id in callback.connected_mtws]
-        print(f"  Connected {len(found)}/4: {found}    ", end="\r")
-        if len(found) == 4:
+            n_connected = len(callback.connected_mtws)
+            connected_ids = list(callback.connected_mtws)
+        print(f"  Connected {n_connected}/4    ", end="\r")
+        if n_connected >= 4:
             break
         time.sleep(1)
 
+    # Auto-detect participant from sensor IDs
+    global participant_name
+    participant_name, sensor_map = auto_detect_sensor_map(connected_ids)
+    callback.sensor_map = sensor_map
     print(f"\nAll 4 sensors connected!")
+    print(f"Auto-detected: {participant_name}")
+    print(f"Sensor map: {sensor_map}")
 
     # Go to measurement mode
     if not master.gotoMeasurement():
