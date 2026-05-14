@@ -106,30 +106,34 @@ def classify_window(window):
     return CLASSES[int(np.argmax(score))]
 
 # ── Rolling buffers — one per body part ──────────────────────────────────────
-BUFFERS = {bp: collections.deque(maxlen=WINDOW_SIZE * 2) for bp in BODY_PARTS}
+BUFFERS       = {bp: collections.deque(maxlen=WINDOW_SIZE * 4) for bp in BODY_PARTS}
 sample_counts = {bp: 0 for bp in BODY_PARTS}
 
-task_counts   = {t: 0 for t in TASK_LABELS}
-window_count  = 0
+task_counts    = {t: 0 for t in TASK_LABELS}
+window_count   = 0
 last_detection = "Waiting..."
-last_quality   = ""
+last_quality   = "—"
+history        = []   # list of {time, movement, quality}
+
+def compute_quality(filtered_window):
+    """Compute jerk-based quality label from a filtered window."""
+    jerk_val = float(np.mean([
+        _jerk(filtered_window[:, i]) for i in range(filtered_window.shape[1])
+    ]))
+    if jerk_val < 50:   return "Smooth 🟢",   jerk_val
+    if jerk_val < 150:  return "Moderate 🟡", jerk_val
+    return               "Jerky 🔴",          jerk_val
 
 def write_live_data(status="running"):
-    jerk_val = 0.0
-    if len(BUFFERS["Hand"]) >= 10:
-        arr = np.array(list(BUFFERS["Hand"]))[-100:]
-        if arr.shape[0] > 1 and arr.ndim == 2:
-            jerk_val = float(np.mean([_jerk(arr[:, i]) for i in range(arr.shape[1])]))
-    quality = "Smooth" if jerk_val < 50 else ("Moderate" if jerk_val < 150 else "Jerky")
-
     data = {
         "status":        status,
         "participant":   PARTICIPANT,
         "task_counts":   task_counts,
         "window_count":  window_count,
         "last_detected": last_detection,
-        "quality":       quality,
+        "quality":       last_quality,
         "timestamp":     time.time(),
+        "history":       history[-20:],   # last 20 detections
         "signal_preview": {
             bp: [list(row) for row in list(BUFFERS[bp])[-200:]]
             for bp in BODY_PARTS if len(BUFFERS[bp]) > 0
@@ -173,7 +177,7 @@ class XsCallback(xda.XsCallback):
         sample_counts[body_part] += 1
 
         # Classify when all buffers have enough data
-        global window_count, last_detection
+        global window_count, last_detection, last_quality
         if all(len(BUFFERS[bp]) >= WINDOW_SIZE for bp in BODY_PARTS):
             if sample_counts["Hand"] % STEP_SIZE == 0:
                 try:
@@ -181,13 +185,21 @@ class XsCallback(xda.XsCallback):
                         np.array(list(BUFFERS[bp]))[-WINDOW_SIZE:]
                         for bp in BODY_PARTS
                     ])
-                    filt    = bandpass(win)
-                    label   = classify_window(filt)
+                    filt          = bandpass(win)
+                    label         = classify_window(filt)
+                    quality_str, jerk_val = compute_quality(filt)
                     task_counts[label] += 1
                     window_count       += 1
                     last_detection      = TASK_LABELS.get(label, label)
+                    last_quality        = quality_str
+                    history.append({
+                        "Window":    window_count,
+                        "Movement":  last_detection,
+                        "Quality":   quality_str,
+                        "Jerk":      round(jerk_val, 1),
+                    })
                     write_live_data()
-                    print(f"  Window {window_count:4d} → {last_detection}")
+                    print(f"  Window {window_count:4d} → {last_detection}  [{quality_str}]")
                 except Exception as e:
                     print(f"  Classification error: {e}")
 

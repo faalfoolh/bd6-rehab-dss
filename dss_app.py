@@ -303,44 +303,59 @@ elif page == "🔴 Live Monitor":
 
     if using_live and live:
         st.success("🔴 **LIVE** — receiving data from Xsens sensors")
+
         tc     = live.get("task_counts", {})
         total  = live.get("window_count", 0)
         status, color, icon = compliance_status(tc)
+
+        # ── Status banner ──────────────────────────────────────────────
         st.markdown(f"""
         <div style="background:{color}22;border:2px solid {color};border-radius:10px;
                     padding:1rem;margin-bottom:1rem;">
             <h2 style="margin:0;color:{color}">{icon} {status}</h2>
-            <p style="margin:0">Windows classified: <b>{total}</b> &nbsp;|&nbsp;
-            Last detected: <b>{live.get('last_detected','—')}</b> &nbsp;|&nbsp;
-            Quality: <b>{live.get('quality','—')}</b></p>
+            <p style="margin:4px 0 0 0">
+                Windows classified: <b>{total}</b> &nbsp;|&nbsp;
+                Last detected: <b>{live.get('last_detected','—')}</b> &nbsp;|&nbsp;
+                Quality: <b>{live.get('quality','—')}</b>
+            </p>
         </div>""", unsafe_allow_html=True)
 
+        # ── Bar chart ──────────────────────────────────────────────────
         fig = go.Figure(go.Bar(
             x=[TASK_LABELS[t] for t in TASK_LABELS],
             y=[tc.get(t, 0) for t in TASK_LABELS],
             marker_color=[TASK_COLORS[t] for t in TASK_LABELS],
             text=[tc.get(t, 0) for t in TASK_LABELS],
             textposition="outside"))
-        fig.update_layout(yaxis_title="Windows", plot_bgcolor="white",
+        fig.update_layout(yaxis_title="Windows detected", plot_bgcolor="white",
                           height=300, margin=dict(t=20, b=20))
         st.plotly_chart(fig, use_container_width=True)
 
+        # ── Live signal plot ───────────────────────────────────────────
         preview = live.get("signal_preview", {})
         if preview:
-            bp_sel = st.selectbox("Sensor preview", BODY_PARTS, key="live_bp")
+            st.subheader("Live Signal")
+            bp_sel = st.selectbox("Sensor", BODY_PARTS, key="live_bp")
             arr = np.array(preview.get(bp_sel, []))
-            if arr.ndim == 2 and len(arr) > 1:
+            if arr.ndim == 2 and arr.shape[0] > 1 and arr.shape[1] == 3:
                 t_ax = np.arange(len(arr)) / 100.0
                 fig2 = go.Figure()
                 for i, (ax, c) in enumerate(zip(["Roll", "Pitch", "Yaw"],
                                                 ["#E74C3C", "#3498DB", "#2ECC71"])):
                     fig2.add_trace(go.Scatter(x=t_ax, y=arr[:, i], name=ax,
-                                              line=dict(color=c, width=1.2)))
+                                              line=dict(color=c, width=1.5)))
                 fig2.update_layout(xaxis_title="Time (s)", yaxis_title="Angle (°)",
                                    plot_bgcolor="white", height=260,
                                    legend=dict(orientation="h", y=1.1),
                                    margin=dict(t=10, b=10))
                 st.plotly_chart(fig2, use_container_width=True)
+
+        # ── History table ──────────────────────────────────────────────
+        history = live.get("history", [])
+        if history:
+            st.subheader("Detection History")
+            st.dataframe(pd.DataFrame(history[::-1]),   # newest first
+                         use_container_width=True, hide_index=True)
 
         time.sleep(1)
         st.rerun()
