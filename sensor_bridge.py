@@ -191,7 +191,7 @@ def main():
     port_info_array = xda.XsScanner.scanPorts()
     awinda_port = None
     for port_info in port_info_array:
-        if port_info.deviceId().isAwinda():
+        if port_info.deviceId().isAwinda2():
             awinda_port = port_info
             break
 
