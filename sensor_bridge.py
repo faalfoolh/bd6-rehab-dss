@@ -8,7 +8,7 @@ classifies movement windows in real-time using the saved LDA weights,
 and writes results to live_data.json so the Streamlit app can read them.
 """
 
-import os, sys, json, time, collections
+import os, sys, json, time, collections, threading
 import numpy as np
 from scipy import signal as sp_signal
 from scipy.signal import find_peaks
@@ -142,7 +142,20 @@ def write_live_data(status="running"):
 class XsCallback(xda.XsCallback):
     def __init__(self, sensor_map):
         super().__init__()
-        self.sensor_map = sensor_map   # device_id_str -> body_part
+        self.sensor_map      = sensor_map
+        self.connected_mtws  = set()
+        self._lock           = threading.Lock()
+
+    def onConnectivityChanged(self, dev, new_state):
+        dev_id = str(dev.deviceId())
+        with self._lock:
+            # XCS_Wireless = 8  (connected wirelessly)
+            if new_state == 8:
+                self.connected_mtws.add(dev_id)
+                bp = self.sensor_map.get(dev_id, "Unknown")
+                print(f"\n  + Connected: {dev_id} ({bp})")
+            else:
+                self.connected_mtws.discard(dev_id)
 
     def onLiveDataAvailable(self, dev, packet):
         if not packet.containsOrientation():
@@ -212,12 +225,13 @@ def main():
     print(f"Master device: {master_id}")
     print("Waiting for MTW sensors to connect (turn them on now)...")
 
-    # Wait until all 4 MTW sensors are connected
+    # Wait until all 4 MTW sensors are connected via onConnectivityChanged
+    print("  (Turn on the 4 MTW sensors now...)")
     while True:
-        children = [master.child(i) for i in range(master.childCount())]
-        connected_ids = [str(c.deviceId()) for c in children]
-        found = [bp for dev_id, bp in sensor_map.items() if dev_id in connected_ids]
-        print(f"  Connected: {found}", end="\r")
+        with callback._lock:
+            found = [bp for dev_id, bp in sensor_map.items()
+                     if dev_id in callback.connected_mtws]
+        print(f"  Connected {len(found)}/4: {found}    ", end="\r")
         if len(found) == 4:
             break
         time.sleep(1)
